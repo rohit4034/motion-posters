@@ -53,6 +53,8 @@ docker compose run --rm -v "$PWD/tests:/app/tests:ro" studio python -m unittest 
 
 Tests cover MP4 encoding and range downloads, duplicate generation caching, invalid media, API key and cost confirmation, daily budget limits, paid submission retry prevention, password protection, cross-origin write rejection, and prompt caching. No paid video request is used for testing.
 
+Initial instance verification: all eight integration tests passed; Chromium checked desktop and 390px mobile layouts, all three aspect ratios, text controls, clip history, and an actual MP4 download without browser errors. A live NVIDIA prompt request succeeded. Grok video generation remains unverified until a valid xAI key is configured.
+
 ## Project layout
 
 ```text
