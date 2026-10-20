@@ -1,41 +1,56 @@
 # Frame — Motion Poster Studio
 
-A self-hosted motion poster editor. Upload artwork, choose a motion style, add crisp text overlays, and export an MP4. Designed for a small CPU instance: AI inference stays with hosted providers.
+A self-hosted motion poster editor. Upload artwork, choose a motion style, add crisp text, and export an MP4. All video rendering runs locally on the CPU. **No paid video generation or external video API is supported.**
 
-## Run locally
+## Run
 
 ```bash
 cp .env.example .env
 docker compose up -d --build
 ```
 
-Open **http://localhost:4173** on the instance. For a remote instance, forward port 4173 with SSH or your editor. The Compose port binds to loopback by default.
+Open **http://localhost:4173** on the instance. Forward port 4173 with SSH or your editor when accessing a remote instance. The Compose port is bound to loopback by default. Frontend and backend share this port.
 
-Both frontend and backend are served from port 4173. No JavaScript build toolchain is required. FastAPI handles jobs and FFmpeg exports H.264 MP4. A persistent Docker volume stores uploaded images, overlays, job history, and videos. One worker renders at a time to limit CPU use. Use one Uvicorn worker.
+## Architecture learning guide
 
-## Modes and API keys
+Open **http://localhost:4173/architecture.html**, or open [frontend/architecture.html](frontend/architecture.html) directly in a browser. The single-file guide works offline with no external fonts, scripts, images, or model requests. It includes:
 
-- **Local motion:** free from API charges. Slow zoom, horizontal pan, and soft float are deterministic animation, without generative scene changes. Exports are silent.
-- **Grok Imagine:** image-to-video through `grok-imagine-video-1.5-lite`, preserving generated audio when supplied. Set `XAI_API_KEY` to an **xAI** key. A **Groq** key (`gsk_…`) is a different provider and cannot generate Grok videos.
-- **NVIDIA creative assist:** generates a motion direction from your written artwork description. Set `NVIDIA_API_KEY` and optionally `NVIDIA_TEXT_MODEL`. The artwork itself is not sent for prompt refinement.
+- A clickable SVG diagram comparing the implemented app with the proposed AI architecture.
+- Six AI engineering patterns with explanations and primary documentation.
+- Step-by-step simulations for normal work, quota exhaustion, invalid plans, and restart recovery.
+- Proposed ScenePlan contract, evaluation records, and phased implementation.
+- Review of the user's Wix video-template references and original schematic design interpretations.
+- HTML and SVG downloads, plus a print/PDF layout.
 
-Keys belong in the ignored `.env` or Dokploy runtime environment. Never commit them. After editing `.env`, use `docker compose up -d --force-recreate`.
+The proposed architecture is **AI-assisted planning → validated scene data → local CPU rendering**. Typed planners, LangGraph checkpoints, richer templates, worker leases, atomic publication, and automated quality checks are future work. The guide labels implemented and proposed behavior explicitly.
 
-No free xAI API quota is assumed or promised. Any promotional credits depend on your account. Grok estimates use published Lite pricing: $0.02/sec at 480p, $0.03/sec at 720p, plus $0.01 for one input image. Verify current prices and model availability in your xAI account. The UI requires confirmation before a paid generation. `MAX_DAILY_USD` defaults to $2; reservations conservatively include failed requests because provider acceptance/billing can be ambiguous. It is an application estimate cap, not a provider billing guarantee. NVIDIA prompt calls have separate account limits.
+## What local rendering does
 
-## Reliability and privacy
+FFmpeg animates existing artwork using slow zoom, horizontal pan, or soft float, then composites the text overlay and encodes H.264 MP4. It does not synthesize new scenes or objects. Exports are silent. No GPU, hosted video model, or API key is required. There are no video API charges; your instance still uses compute and storage.
 
-Identical clip requests reuse the existing queued/completed job. Jobs survive restarts. A saved xAI request ID is polled again after restart; an interrupted submission without a request ID is never automatically repeated. Polling errors do not trigger a new billable generation. Provider response metadata stays server-side, while keys are never returned by the API. Stored media and SQLite are under `data/` (the Docker volume in production).
+The frontend uses Canvas for preview and PNG overlay preparation. FastAPI validates requests. SQLite stores job snapshots and prompt cache results. A bounded in-process queue renders one job at a time. Startup requeues unfinished local jobs; this is not a persistent graph workflow. Use one Uvicorn worker.
 
-Uploads accept PNG/JPEG/WebP up to 6 MB / 16 megapixels. The browser prepares artwork and transparent text overlays at output resolution. Text is composited with FFmpeg after motion generation, keeping overlays stable and exact. Text already baked into an uploaded poster may still move or change with generative animation.
+A persistent Docker volume stores uploaded images, overlays, jobs, and completed videos under `/app/data`. Requests with the same content fingerprint reuse a queued or completed job. Unknown/external video modes are rejected, including when an xAI key exists in the environment. Legacy unfinished external-video jobs are stopped without a provider call.
 
-The studio is a **single-owner application**, not a multi-tenant service. Use `APP_PASSWORD` before exposing it beyond localhost; the HTTP Basic username is `studio`. Place it behind HTTPS in Dokploy. All visitors with that password share the same clip library and API budget.
+## Optional NVIDIA creative assistance
 
-## Dokploy
+`NVIDIA_API_KEY` enables the explicit “Refine with NVIDIA” button. `NVIDIA_TEXT_MODEL` selects the hosted text model. The endpoint sends a written artwork description, not the image, to produce creative direction notes. **The current renderer follows the selected preset; it does not interpret those notes as a scene plan.**
 
-Create an Application from this GitHub repo with Dockerfile build, container port **4173**, and a persistent volume at **`/app/data`**. Set `APP_PASSWORD` and provider keys in Dokploy's environment settings. Add your domain and HTTPS there. Alternatively import `compose.yaml`; leave the host loopback binding in place for local use, and use Dokploy's internal service routing for a domain. This repo includes deployment configuration; creating a Dokploy domain is a separate step.
+Hosted text assistance has separate account limits and potentially billing. It is never required for local video rendering. Groq and xAI/Grok are different services. No Groq integration is currently implemented; the architecture guide proposes it only for optional text planning with verified account access. There is no automatic paid fallback.
 
-## Development and tests
+Store keys only in the ignored `.env` or Dokploy runtime environment. Restart after changes:
+
+```bash
+docker compose up -d --force-recreate
+```
+
+## Access and Dokploy
+
+This is a **single-owner app**, not a multi-tenant service. Set `APP_PASSWORD` before exposing it beyond localhost; HTTP Basic username is `studio`. All authenticated visitors share one clip library. Use HTTPS for network access.
+
+In Dokploy, create an Application from this GitHub repository using its Dockerfile, container port **4173**, and a persistent volume at **`/app/data`**. Configure `APP_PASSWORD` and optional NVIDIA credentials in runtime settings. Add a domain and HTTPS in Dokploy when needed. `compose.yaml` provides the local persistent service and configured limits of 1.5 CPU / 768 MB; measure actual capacity before increasing concurrency.
+
+## Development and verification
 
 Python 3.12 and FFmpeg are required outside Docker:
 
@@ -45,23 +60,20 @@ python -m venv .venv
 .venv/bin/uvicorn backend.app:app --host 127.0.0.1 --port 4173
 ```
 
-Run integration tests against an isolated temporary database and mocked paid providers:
+Run integration tests in an isolated temporary database, with hosted inference mocked:
 
 ```bash
 docker compose run --rm -v "$PWD/tests:/app/tests:ro" studio python -m unittest discover -s tests -v
 ```
 
-Tests cover MP4 encoding and range downloads, duplicate generation caching, invalid media, API key and cost confirmation, daily budget limits, paid submission retry prevention, password protection, cross-origin write rejection, and prompt caching. No paid video request is used for testing.
+Tests verify real local MP4 rendering and byte-range downloads, request caching, invalid media, rejection of external video generation even with a key, a local render without network access, password protection, cross-origin write rejection, and optional prompt caching. Browser verification covers desktop/mobile editing, export, library, and the architecture guide. No paid video request is used.
 
-Initial instance verification: all eight integration tests passed; Chromium checked desktop and 390px mobile layouts, all three aspect ratios, text controls, clip history, and an actual MP4 download without browser errors. A live NVIDIA prompt request succeeded. Grok video generation remains unverified until a valid xAI key is configured.
-
-## Project layout
+## Layout
 
 ```text
-frontend/           Browser editor, canvas preview, clip library
-backend/app.py      API, SQLite jobs, single render worker, FFmpeg
-backend/providers.py Hosted inference interfaces
-tests/              Integration and provider-boundary tests
-Dockerfile          CPU-only runtime
-compose.yaml        Local persistent service / Dokploy starting point
+frontend/architecture.html  Offline interactive learning guide
+frontend/                   Editor, canvas preview, clip library
+backend/app.py              API, SQLite jobs, CPU FFmpeg worker
+backend/providers.py        Optional NVIDIA text assistance
+Dockerfile / compose.yaml   Small-instance deployment
 ```

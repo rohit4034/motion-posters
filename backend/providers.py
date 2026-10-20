@@ -1,8 +1,6 @@
 """Provider boundary: no API keys or upstream response bodies reach clients."""
-import json
 import os
 import time
-from pathlib import Path
 
 import httpx
 
@@ -17,39 +15,10 @@ def check_response(response):
     if response.status_code == 402:
         raise ProviderError("Your provider account needs credits. Free API requests are not guaranteed.")
     if response.status_code == 429:
-        raise ProviderError("Provider rate limit reached. Wait before trying again; no automatic paid retry was made.")
+        raise ProviderError("Provider rate limit reached. Wait before trying again; no automatic retry was made.")
     if response.is_error:
         raise ProviderError(f"Provider request failed (HTTP {response.status_code}). Check model availability and billing.")
     return response.json()
-
-
-class XaiVideoProvider:
-    name = "xai"
-
-    def __init__(self):
-        self.model = os.getenv("XAI_VIDEO_MODEL", "grok-imagine-video-1.5-lite")
-
-    async def submit(self, spec, image):
-        key = os.getenv("XAI_API_KEY", "").strip()
-        if not key:
-            raise ProviderError("Grok is not connected. Add XAI_API_KEY to the server .env and restart.")
-        async with httpx.AsyncClient(timeout=90) as client:
-            response = await client.post(
-                "https://api.x.ai/v1/videos/generations",
-                headers={"Authorization": f"Bearer {key}"},
-                json={"model": self.model, "prompt": spec["prompt"],
-                      "image": {"url": image}, "duration": spec["duration"],
-                      "aspect_ratio": spec["aspect"], "resolution": spec["resolution"]},
-            )
-            return check_response(response)
-
-    async def status(self, request_id):
-        async with httpx.AsyncClient(timeout=45) as client:
-            response = await client.get(
-                f"https://api.x.ai/v1/videos/{request_id}",
-                headers={"Authorization": f"Bearer {os.environ['XAI_API_KEY']}"},
-            )
-            return check_response(response)
 
 
 class NvidiaTextProvider:

@@ -74,33 +74,30 @@ class StudioTests(unittest.TestCase):
         response = self.client.post("/api/clips", json=payload(duration=100))
         self.assertEqual(response.status_code, 422)
 
-    def test_grok_requires_key_and_cost_confirmation(self):
-        response = self.client.post("/api/clips", json=payload(mode="grok"))
-        self.assertEqual(response.status_code, 503)
-        with patch.dict(os.environ, {"XAI_API_KEY": "test-key"}):
-            response = self.client.post("/api/clips", json=payload(mode="grok"))
-            self.assertEqual(response.status_code, 422)
-
-    def test_daily_budget_blocks_upstream_call(self):
-        with patch.dict(os.environ, {"XAI_API_KEY": "test-key", "MAX_DAILY_USD": "0.05"}):
-            with patch.object(studio.video_provider, "submit", new_callable=AsyncMock) as submit:
+    def test_external_video_generation_is_always_rejected(self):
+        for key in ("", "xai-test-key"):
+            with patch.dict(os.environ, {"XAI_API_KEY": key}):
                 response = self.client.post("/api/clips", json=payload(mode="grok", confirm_cost=True))
-                self.assertEqual(response.status_code, 429)
-                submit.assert_not_called()
+                self.assertEqual(response.status_code, 422)
+                self.assertEqual(self.client.get("/api/clips").json(), [])
 
-    def test_failed_submission_never_automatically_retries(self):
-        with patch.dict(os.environ, {"XAI_API_KEY": "test-key"}):
-            with patch.object(studio.video_provider, "submit", new_callable=AsyncMock, side_effect=ProviderError("Provider rate limit reached")) as submit:
-                response = self.client.post("/api/clips", json=payload(mode="grok", confirm_cost=True))
-                job = response.json()
-                for _ in range(30):
-                    job = self.client.get("/api/clips/" + job["id"]).json()
-                    if job["status"] == "failed":
-                        break
-                    time.sleep(.05)
-                self.assertEqual(job["status"], "failed")
-                self.assertEqual(submit.await_count, 1)
-                self.assertNotIn("request_id", job)
+    def test_config_has_no_paid_generation(self):
+        result = self.client.get("/api/config").json()
+        self.assertEqual(result["video_generation"], "local_only")
+        self.assertFalse(result["paid_video_generation_enabled"])
+
+    def test_no_network_for_local_export(self):
+        with patch("httpx.AsyncClient", side_effect=AssertionError("Local render attempted a network call")):
+            response = self.client.post("/api/clips", json=payload(preset="float"))
+            self.assertEqual(response.status_code, 202)
+            job = response.json()
+            for _ in range(120):
+                job = self.client.get("/api/clips/" + job["id"]).json()
+                if job["status"] in ("completed", "failed"):
+                    break
+                time.sleep(.1)
+            self.assertEqual(job["status"], "completed", job)
+            self.assertEqual(job["estimated_usd"], 0)
 
     def test_cross_origin_write_is_rejected(self):
         response = self.client.post("/api/clips", json=payload(), headers={"Origin": "https://untrusted.example"})

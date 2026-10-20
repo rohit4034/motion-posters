@@ -5,14 +5,13 @@ import hmac
 import io
 import json
 import os
-import secrets
+import re
 import shutil
 import sqlite3
 import subprocess
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
@@ -25,14 +24,13 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field
 
-from .providers import NvidiaTextProvider, ProviderError, XaiVideoProvider
+from .providers import NvidiaTextProvider, ProviderError
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
 DATA = Path(os.getenv("DATA_DIR", str(ROOT / "data")))
 DATA.mkdir(parents=True, exist_ok=True)
 Image.MAX_IMAGE_PIXELS = 16_000_000
-video_provider = XaiVideoProvider()
 queue = asyncio.Queue(maxsize=16)
 
 
@@ -65,16 +63,6 @@ def public_job(job):
     return {k: v for k, v in job.items() if k not in ("fingerprint", "request_id", "upstream", "spec")}
 
 
-def estimated_cost(duration, resolution):
-    return round(duration * {"480p": .02, "720p": .03}[resolution] + .01, 2)
-
-
-def spent_today():
-    today = datetime.now(timezone.utc).date()
-    return round(sum(j.get("estimated_usd", 0) for j in list_jobs()
-                     if j["mode"] == "grok" and datetime.fromtimestamp(j["created"], timezone.utc).date() == today), 2)
-
-
 def decode_image(value, path):
     if not value.startswith(("data:image/png;base64,", "data:image/jpeg;base64,", "data:image/webp;base64,")):
         raise HTTPException(422, "Use a PNG, JPEG, or WebP image.")
@@ -92,7 +80,7 @@ def decode_image(value, path):
 
 class ClipSpec(BaseModel):
     title: str = Field(default="Untitled motion", max_length=100)
-    mode: Literal["local", "grok"] = "local"
+    mode: Literal["local"] = "local"
     preset: Literal["zoom", "pan", "float"] = "zoom"
     duration: Literal[5, 10, 15] = 5
     aspect: Literal["9:16", "1:1", "16:9"] = "9:16"
@@ -100,7 +88,6 @@ class ClipSpec(BaseModel):
     prompt: str = Field(default="Slow cinematic push-in. Preserve the source artwork.", min_length=5, max_length=2000)
     image: str = Field(max_length=9_000_000)
     overlay: str = Field(max_length=9_000_000)
-    confirm_cost: bool = False
 
 
 class PromptSpec(BaseModel):
@@ -114,80 +101,35 @@ def dimensions(spec):
     return {"9:16": (edge, long), "16:9": (long, edge), "1:1": (edge, edge)}[spec["aspect"]]
 
 
-def render_clip(job, cloud=False):
+def render_clip(job):
     folder = DATA / job["id"]
     spec = job["spec"]
     w, h = dimensions(spec)
     frames = spec["duration"] * 24
-    inputs = ["-i", str(folder / "source.mp4")] if cloud else ["-i", str(folder / "artwork.png")]
-    if cloud:
-        motion = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1,fps=24"
-    else:
-        z = {"zoom": f"1+0.09*on/{frames}", "pan": "1.10", "float": f"1.06+0.02*sin(on/{frames}*2*PI)"}[spec["preset"]]
-        x = f"(iw-iw/zoom)*on/{frames}" if spec["preset"] == "pan" else "iw/2-iw/zoom/2"
-        motion = (f"scale={w*2}:{h*2}:force_original_aspect_ratio=increase,crop={w*2}:{h*2},"
-                  f"zoompan=z='{z}':x='{x}':y='ih/2-ih/zoom/2':d={frames}:s={w}x{h}:fps=24,setsar=1")
-    command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-threads", "1", *inputs,
-               "-loop", "1", "-i", str(folder / "overlay.png"),
+    z = {"zoom": f"1+0.09*on/{frames}", "pan": "1.10", "float": f"1.06+0.02*sin(on/{frames}*2*PI)"}[spec["preset"]]
+    x = f"(iw-iw/zoom)*on/{frames}" if spec["preset"] == "pan" else "iw/2-iw/zoom/2"
+    motion = (f"scale={w*2}:{h*2}:force_original_aspect_ratio=increase,crop={w*2}:{h*2},"
+              f"zoompan=z='{z}':x='{x}':y='ih/2-ih/zoom/2':d={frames}:s={w}x{h}:fps=24,setsar=1")
+    command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-threads", "1",
+               "-i", str(folder / "artwork.png"), "-loop", "1", "-i", str(folder / "overlay.png"),
                "-filter_complex_threads", "1", "-filter_complex",
                f"[0:v]{motion}[bg];[1:v]scale={w}:{h},format=rgba[fg];[bg][fg]overlay=0:0:shortest=1,format=yuv420p[out]",
-               "-map", "[out]"]
-    if cloud:
-        command += ["-map", "0:a?", "-c:a", "aac"]
-    command += ["-t", str(spec["duration"]), "-c:v", "libx264", "-threads", "1", "-preset", "veryfast", "-crf", "22", "-movflags", "+faststart", str(folder / "clip.mp4")]
+               "-map", "[out]", "-t", str(spec["duration"]), "-c:v", "libx264", "-threads", "1",
+               "-preset", "veryfast", "-crf", "22", "-movflags", "+faststart", str(folder / "clip.mp4")]
     subprocess.run(command, check=True, capture_output=True, timeout=240)
 
 
 async def process(job):
     started = time.monotonic()
-    folder = DATA / job["id"]
     try:
         job.update(status="rendering", progress=12, message="Preparing your artwork")
         save(job)
-        if job["mode"] == "grok":
-            if not job.get("request_id"):
-                # Never automatically retry a submission: upstream acceptance can be ambiguous.
-                job.update(status="submitting", message="Sending artwork to Grok", submission_attempted=True)
-                save(job)
-                image = "data:image/png;base64," + base64.b64encode((folder / "artwork.png").read_bytes()).decode()
-                result = await video_provider.submit(job["spec"], image)
-                job["request_id"] = result["request_id"]
-                job["upstream"] = result
-                save(job)
-            job.update(status="generating", progress=30, message="Grok is animating your artwork. This may take a few minutes.")
-            save(job)
-            for index in range(180):
-                await asyncio.sleep(5)
-                result = await video_provider.status(job["request_id"])
-                job["upstream"] = result
-                if result.get("status") == "done":
-                    url = result["video"]["url"]
-                    parsed = urlparse(url)
-                    if parsed.scheme != "https" or not (parsed.hostname or "").endswith(".x.ai"):
-                        raise ProviderError("Unexpected provider download host. The upstream request is saved for recovery.")
-                    async with httpx.AsyncClient(timeout=180, follow_redirects=False) as client:
-                        async with client.stream("GET", url) as response:
-                            response.raise_for_status()
-                            total = 0
-                            with (folder / "source.mp4").open("wb") as f:
-                                async for chunk in response.aiter_bytes():
-                                    total += len(chunk)
-                                    if total > 100_000_000:
-                                        raise ProviderError("Generated video exceeds the 100 MB download limit.")
-                                    f.write(chunk)
-                    break
-                if result.get("status") in ("expired", "failed"):
-                    raise ProviderError("Grok could not complete this generation. No paid retry was made.")
-                job["progress"] = min(78, 30 + index)
-                save(job)
-            else:
-                raise ProviderError("Generation timed out. Its request ID was saved; no paid retry was made.")
         job.update(status="rendering", progress=85, message="Rendering crisp text and preparing your MP4")
         save(job)
-        await asyncio.to_thread(render_clip, job, job["mode"] == "grok")
+        await asyncio.to_thread(render_clip, job)
         job.update(status="completed", progress=100, message="Your motion poster is ready", video_url=f"/api/clips/{job['id']}/video", latency_ms=round((time.monotonic()-started)*1000))
     except Exception as exc:
-        message = str(exc) if isinstance(exc, ProviderError) else "The clip could not be completed. Check server logs; no automatic paid retry was made."
+        message = str(exc) if isinstance(exc, ProviderError) else "The clip could not be completed. Check server logs and try again."
         print(f"Clip {job['id']} failed: {type(exc).__name__}", flush=True)
         job.update(status="failed", message=message, progress=0)
     finally:
@@ -211,8 +153,8 @@ async def lifespan(app):
     task = asyncio.create_task(worker())
     for job in reversed(list_jobs()):
         if job["status"] not in ("completed", "failed"):
-            if job["mode"] == "grok" and job.get("submission_attempted") and not job.get("request_id"):
-                job.update(status="failed", message="Server stopped during submission. Check xAI usage before generating again; submission was not retried.")
+            if job["mode"] != "local":
+                job.update(status="failed", message="External video generation is disabled. This legacy job was stopped without a provider call.")
                 save(job)
             else:
                 await queue.put(job["id"])
@@ -246,6 +188,21 @@ async def guard(request: Request, call_next):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "same-origin"
     response.headers["Content-Security-Policy"] = "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'"
+    if request.url.path == "/architecture.html":
+        # The downloadable guide is a single offline HTML file. Permit only its
+        # exact inline code, rather than relaxing the studio's script policy.
+        guide = (ROOT / "frontend" / "architecture.html").read_text()
+        hashes = {}
+        for tag in ("script", "style"):
+            hashes[tag] = " ".join(
+                "'sha256-" + base64.b64encode(hashlib.sha256(part.encode()).digest()).decode() + "'"
+                for part in re.findall(rf"<{tag}>(.*?)</{tag}>", guide, re.S)
+            )
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'none'; img-src data: blob:; "
+            f"script-src {hashes['script']}; style-src {hashes['style']}; "
+            "frame-ancestors 'none'; base-uri 'none'; object-src 'none'"
+        )
     return response
 
 
@@ -256,10 +213,10 @@ def health():
 
 @app.get("/api/config")
 def config():
-    return {"grok_connected": bool(os.getenv("XAI_API_KEY")), "nvidia_connected": bool(os.getenv("NVIDIA_API_KEY")),
-            "model": video_provider.model, "local_ready": bool(shutil.which("ffmpeg")),
-            "daily_limit_usd": float(os.getenv("MAX_DAILY_USD", "2")), "reserved_today_usd": spent_today(),
-            "pricing": {"480p": .02, "720p": .03, "image_input": .01}, "free_api_quota_verified": False}
+    return {"nvidia_connected": bool(os.getenv("NVIDIA_API_KEY")),
+            "local_ready": bool(shutil.which("ffmpeg")), "video_generation": "local_only",
+            "paid_video_generation_enabled": False}
+
 
 
 @app.get("/api/clips")
@@ -293,18 +250,11 @@ async def create_clip(spec: ClipSpec):
         raise HTTPException(503, "MP4 renderer is not installed. Start the Docker Compose service.")
     if queue.full():
         raise HTTPException(429, "The render queue is full. Try again after a clip finishes.")
-    if spec.mode == "grok" and not os.getenv("XAI_API_KEY"):
-        raise HTTPException(503, "Grok is not connected. Add XAI_API_KEY to .env and restart. Local motion is free to use.")
-    if spec.mode == "grok" and not spec.confirm_cost:
-        raise HTTPException(422, "Confirm the estimated API cost before generating.")
     payload = spec.model_dump()
-    fingerprint = hashlib.sha256(json.dumps({**payload, "model": video_provider.model}, sort_keys=True).encode()).hexdigest()
+    fingerprint = hashlib.sha256(json.dumps({**payload, "renderer_version": "local-v2"}, sort_keys=True).encode()).hexdigest()
     for existing in list_jobs():
         if existing["fingerprint"] == fingerprint and existing["status"] != "failed":
             return public_job(existing)
-    cost = estimated_cost(spec.duration, spec.resolution) if spec.mode == "grok" else 0
-    if cost + spent_today() > float(os.getenv("MAX_DAILY_USD", "2")):
-        raise HTTPException(429, "The daily Grok estimate limit has been reached. Local motion is still available.")
     job_id = uuid.uuid4().hex
     folder = DATA / job_id
     folder.mkdir()
@@ -318,7 +268,7 @@ async def create_clip(spec: ClipSpec):
     payload.pop("overlay")
     job = {"id": job_id, "fingerprint": fingerprint, "created": time.time(), "title": spec.title,
            "mode": spec.mode, "preset": spec.preset, "duration": spec.duration, "aspect": spec.aspect,
-           "resolution": spec.resolution, "estimated_usd": cost, "status": "queued", "progress": 0,
+           "resolution": spec.resolution, "estimated_usd": 0, "status": "queued", "progress": 0,
            "message": "Waiting for the renderer", "spec": payload}
     save(job)
     queue.put_nowait(job_id)
