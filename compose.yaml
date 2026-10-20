@@ -1,0 +1,13 @@
+services:
+  studio:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:4173:4173"
+    env_file: .env
+    volumes:
+      - studio-data:/app/data
+    mem_limit: 768m
+    cpus: 1.5
+volumes:
+  studio-data:

@@ -218,3 +218,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Motion Poster Studio
+.env
+.venv/
+data/
+__pycache__/
+.pytest_cache/
+node_modules/
+test-results/
+*.log
